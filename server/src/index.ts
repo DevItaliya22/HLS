@@ -23,8 +23,19 @@ const HLS_RESOLUTIONS = [
     { name: '360p', resolution: '640x360', bitrate: '800k' },
     { name: '480p', resolution: '854x480', bitrate: '1200k' },
     { name: '720p', resolution: '1280x720', bitrate: '2000k' },
-    { name: '1080p', resolution: '1920x1080', bitrate: '4000k' }
 ];
+
+// GLOBAL MEMORY STORE for tracking chunk processing
+interface ChunkProcessingStatus {
+    streamId: string;
+    chunkFilename: string;
+    chunkNumber: string;
+    completedResolutions: Set<string>;
+    totalResolutions: number;
+    startTime: number;
+}
+
+const processingQueue = new Map<string, ChunkProcessingStatus>();
 
 // Function to ensure directory exists
 function ensureDirectoryExists(dirPath: string) {
@@ -62,69 +73,160 @@ const upload = multer({ storage: storage });
 
 // HLS PROCESSING FUNCTIONS
 
-// Convert chunk to HLS segments for all resolutions
-async function convertChunkToHLS(streamId: string, chunkFilename: string): Promise<boolean> {
+// Get chunk processing status
+function getChunkProcessingStatus(streamId: string, chunkFilename: string): ChunkProcessingStatus | null {
+    const key = `${streamId}:${chunkFilename}`;
+    return processingQueue.get(key) || null;
+}
+
+// Add chunk to processing queue
+function addChunkToProcessingQueue(streamId: string, chunkFilename: string, chunkNumber: string): void {
+    const key = `${streamId}:${chunkFilename}`;
+    processingQueue.set(key, {
+        streamId,
+        chunkFilename,
+        chunkNumber,
+        completedResolutions: new Set(),
+        totalResolutions: HLS_RESOLUTIONS.length,
+        startTime: Date.now()
+    });
+    console.log(`📝 Added ${key} to processing queue`);
+}
+
+// Mark resolution as completed for a chunk
+function markResolutionCompleted(streamId: string, chunkFilename: string, resolution: string): boolean {
+    const key = `${streamId}:${chunkFilename}`;
+    const status = processingQueue.get(key);
+    
+    if (status) {
+        status.completedResolutions.add(resolution);
+        console.log(`✅ Completed ${resolution} for ${key} (${status.completedResolutions.size}/${status.totalResolutions})`);
+        
+        // If all resolutions are completed, remove from queue and update playlists
+        if (status.completedResolutions.size === status.totalResolutions) {
+            const processingTime = Date.now() - status.startTime;
+            console.log(`🎉 All resolutions completed for ${key} in ${processingTime}ms`);
+            processingQueue.delete(key);
+            updateMasterPlaylist(streamId);
+            updateGlobalPlaylist();
+            return true; // All completed
+        }
+    }
+    return false; // Still processing
+}
+
+// Get processing statistics
+function getProcessingStats() {
+    const stats = {
+        totalProcessing: processingQueue.size,
+        byStream: {} as Record<string, number>,
+        oldestProcessing: 0
+    };
+    
+    let oldestTime = Date.now();
+    processingQueue.forEach((status) => {
+        stats.byStream[status.streamId] = (stats.byStream[status.streamId] || 0) + 1;
+        if (status.startTime < oldestTime) {
+            oldestTime = status.startTime;
+        }
+    });
+    
+    stats.oldestProcessing = processingQueue.size > 0 ? Date.now() - oldestTime : 0;
+    return stats;
+}
+
+// Convert single resolution for a chunk
+function convertChunkToResolution(
+    streamId: string, 
+    chunkFilename: string, 
+    chunkNumber: string, 
+    resolution: { name: string; resolution: string; bitrate: string }
+): Promise<boolean> {
     return new Promise((resolve) => {
         const chunkPath = path.join(CHUNKS_DIR, streamId, chunkFilename);
         const streamHLSDir = path.join(HLS_OUTPUT_DIR, streamId);
+        const resolutionDir = path.join(streamHLSDir, resolution.name);
         
-        // Ensure HLS stream directory exists
-        ensureDirectoryExists(streamHLSDir);
+        ensureDirectoryExists(resolutionDir);
         
-        // Extract chunk number from filename
-        const chunkMatch = chunkFilename.match(/chunk_(\d+)/);
-        const chunkNumber = chunkMatch ? chunkMatch[1] : Date.now().toString();
+        const outputPattern = path.join(resolutionDir, `segment_${chunkNumber}_%03d.ts`);
+        const playlistPath = path.join(resolutionDir, 'playlist.m3u8');
         
-        let completedResolutions = 0;
-        const totalResolutions = HLS_RESOLUTIONS.length;
+        // FFmpeg command for HLS conversion
+        const ffmpegArgs = [
+            '-i', chunkPath,
+            '-c:v', 'libx264',
+            '-c:a', 'aac',
+            '-vf', `scale=${resolution.resolution}`,
+            '-b:v', resolution.bitrate,
+            '-b:a', '128k',
+            '-f', 'hls',
+            '-hls_time', '2',
+            '-hls_list_size', '0',
+            '-hls_segment_filename', outputPattern,
+            '-hls_flags', 'append_list+independent_segments',
+            playlistPath
+        ];
+        // const ffmpeg = spawn("ffmpeg", [
+        //     "-i", inputPath,
+        //     "-filter_complex",
+        //     "[0:v]split=3[v1][v2][v3];" +
+        //     "[v1]scale=w=640:h=360[v360];" +
+        //     "[v2]scale=w=854:h=480[v480];" +
+        //     "[v3]scale=w=1280:h=720[v720]",
+        //     "-map", "[v360]", "-c:v:0", "libx264", "-b:v:0", "800k",
+        //     "-map", "[v480]", "-c:v:1", "libx264", "-b:v:1", "1400k",
+        //     "-map", "[v720]", "-c:v:2", "libx264", "-b:v:2", "2500k",
+        //     "-f", "hls",
+        //     "-hls_time", "6",
+        //     "-hls_list_size", "0",
+        //     "-hls_segment_filename", `${outputDir}/v%v/seg_%03d.ts`,
+        //     "-master_pl_name", "master.m3u8",
+        //     "-var_stream_map", "v:0 v:1 v:2",
+        //     `${outputDir}/v%v/prog.m3u8`
+        //   ], { stdio: "inherit" });
+        const ffmpeg = spawn('ffmpeg', ffmpegArgs);
         
-        // Process each resolution
-        HLS_RESOLUTIONS.forEach((resolution) => {
-            const resolutionDir = path.join(streamHLSDir, resolution.name);
-            ensureDirectoryExists(resolutionDir);
-            
-            const outputPattern = path.join(resolutionDir, `segment_${chunkNumber}_%03d.ts`);
-            const playlistPath = path.join(resolutionDir, 'playlist.m3u8');
-            
-            // FFmpeg command for HLS conversion
-            const ffmpegArgs = [
-                '-i', chunkPath,
-                '-c:v', 'libx264',
-                '-c:a', 'aac',
-                '-vf', `scale=${resolution.resolution}`,
-                '-b:v', resolution.bitrate,
-                '-b:a', '128k',
-                '-f', 'hls',
-                '-hls_time', '2',
-                '-hls_list_size', '0',
-                '-hls_segment_filename', outputPattern,
-                '-hls_flags', 'append_list+independent_segments',
-                playlistPath
-            ];
-            
-            const ffmpeg = spawn('ffmpeg', ffmpegArgs);
-            
-            ffmpeg.on('close', (code) => {
-                completedResolutions++;
-                if (code === 0) {
-                    console.log(`✅ Converted ${chunkFilename} to ${resolution.name} HLS`);
-                } else {
-                    console.error(`❌ FFmpeg failed for ${resolution.name}: exit code ${code}`);
-                }
-                
-                // Update playlists when all resolutions are done
-                if (completedResolutions === totalResolutions) {
-                    updateMasterPlaylist(streamId);
-                    updateGlobalPlaylist();
-                    resolve(code === 0);
-                }
-            });
-            
-            ffmpeg.stderr.on('data', (data) => {
-                // Uncomment for debugging: console.log(`FFmpeg ${resolution.name}: ${data}`);
-            });
+        ffmpeg.on('close', (code) => {
+            const success = code === 0;
+            if (success) {
+                console.log(`✅ ${resolution.name} conversion completed for ${chunkFilename}`);
+                const allCompleted = markResolutionCompleted(streamId, chunkFilename, resolution.name);
+                resolve(allCompleted);
+            } else {
+                console.error(`❌ ${resolution.name} conversion failed for ${chunkFilename}: exit code ${code}`);
+                resolve(false);
+            }
+        });
+        
+        ffmpeg.stderr.on('data', (data) => {
+            // Uncomment for debugging: console.log(`FFmpeg ${resolution.name}: ${data}`);
         });
     });
+}
+
+// Convert chunk to HLS segments for all resolutions (parallel processing)
+async function convertChunkToHLS(streamId: string, chunkFilename: string): Promise<void> {
+    const chunkMatch = chunkFilename.match(/chunk_(\d+)/);
+    const chunkNumber = chunkMatch ? chunkMatch[1] : Date.now().toString();
+    
+    // Add to processing queue
+    addChunkToProcessingQueue(streamId, chunkFilename, chunkNumber);
+    
+    const streamHLSDir = path.join(HLS_OUTPUT_DIR, streamId);
+    ensureDirectoryExists(streamHLSDir);
+    
+    // Process all resolutions in parallel
+    const conversionPromises = HLS_RESOLUTIONS.map(resolution => 
+        convertChunkToResolution(streamId, chunkFilename, chunkNumber, resolution)
+    );
+    
+    try {
+        await Promise.all(conversionPromises);
+        console.log(`🎬 All resolutions processed for ${chunkFilename}`);
+    } catch (error) {
+        console.error(`Error processing chunk ${chunkFilename}:`, error);
+    }
 }
 
 // Update master playlist for a stream
@@ -198,12 +300,17 @@ function getActiveStreams() {
                 const hlsPath = path.join(HLS_OUTPUT_DIR, streamId, 'master.m3u8');
                 const hasHLS = fs.existsSync(hlsPath);
                 
+                // Get processing status
+                const processingChunks = Array.from(processingQueue.values())
+                    .filter(status => status.streamId === streamId).length;
+                
                 return {
                     id: streamId,
                     chunkCount: chunks.length,
                     latestChunk: chunks[chunks.length - 1] || null,
                     isLive: chunks.length > 0,
-                    hasHLS: hasHLS
+                    hasHLS: hasHLS,
+                    processingChunks: processingChunks
                 };
             });
         
@@ -263,9 +370,6 @@ function cleanupOldChunks(streamId: string, keepLast = 10) {
     }
 }
 
-// API ROUTES
-
-// Upload chunk endpoint (UPDATED with HLS processing)
 app.post('/stream/:streamId/chunk', upload.single('chunk'), async (req, res) => {
     try {
         const { streamId } = req.params;
@@ -277,7 +381,7 @@ app.post('/stream/:streamId/chunk', upload.single('chunk'), async (req, res) => 
         
         console.log(`📥 Received chunk for stream ${streamId}: ${req.file.filename}`);
         
-        // Process chunk to HLS in background
+        // Process chunk to HLS in background (non-blocking)
         convertChunkToHLS(streamId, req.file.filename).catch(error => {
             console.error(`Error converting chunk to HLS: ${error}`);
         });
@@ -296,6 +400,17 @@ app.post('/stream/:streamId/chunk', upload.single('chunk'), async (req, res) => 
     } catch (error) {
         console.error('Error uploading chunk:', error);
         res.status(500).json({ error: 'Failed to upload chunk' });
+    }
+});
+
+// Get processing statistics
+app.get('/processing-stats', (req, res) => {
+    try {
+        const stats = getProcessingStats();
+        res.json(stats);
+    } catch (error) {
+        console.error('Error fetching processing stats:', error);
+        res.status(500).json({ error: 'Failed to fetch processing stats' });
     }
 });
 
@@ -324,13 +439,26 @@ app.get('/stream/:streamId', (req, res) => {
         const hlsPath = path.join(HLS_OUTPUT_DIR, streamId, 'master.m3u8');
         const hasHLS = fs.existsSync(hlsPath);
         
+        // Get available resolutions
+        const availableResolutions: string[] = [];
+        if (hasHLS) {
+            const streamHLSDir = path.join(HLS_OUTPUT_DIR, streamId);
+            HLS_RESOLUTIONS.forEach(res => {
+                const resPath = path.join(streamHLSDir, res.name, 'playlist.m3u8');
+                if (fs.existsSync(resPath)) {
+                    availableResolutions.push(res.name);
+                }
+            });
+        }
+        
         res.json({
             id: streamId,
             chunks,
             totalChunks: chunks.length,
             isLive: true,
             hasHLS: hasHLS,
-            hlsUrl: hasHLS ? `/hls/${streamId}/master.m3u8` : null
+            hlsUrl: hasHLS ? `/hls/${streamId}/master.m3u8` : null,
+            availableResolutions: availableResolutions
         });
     } catch (error) {
         console.error(`Error fetching stream ${req.params.streamId}:`, error);
@@ -449,10 +577,11 @@ app.use(express.static(PUBLIC_DIR));
 // Basic HTML page for testing (will be served at /)
 app.get('/', (req, res) => {
     res.send(`
-        <h1>Streaming Server with HLS - Step 2</h1>
+        <h1>Streaming Server with HLS - Enhanced</h1>
         <p>Server is running! 🚀</p>
         <ul>
             <li><a href="/streams">View all streams</a></li>
+            <li><a href="/processing-stats">Processing Statistics</a></li>
             <li><a href="/watch">Watch streams</a></li>
             <li><a href="/hls/media.m3u8">Global HLS Playlist</a></li>
         </ul>
@@ -464,35 +593,18 @@ function startServer() {
     initializeDirectories();
     
     app.listen(PORT, () => {
-        console.log(`
-🚀 Streaming Server with HLS Started!
-📡 Server running on: http://localhost:${PORT}
-📁 Chunks directory: ${CHUNKS_DIR}
-🎬 HLS output directory: ${HLS_OUTPUT_DIR}
-📺 Ready to receive streams and convert to HLS!
-
-API Endpoints:
-- POST /stream/:streamId/chunk (upload chunks)
-- GET /streams (list all streams)  
-- GET /stream/:streamId (get stream info)
-- GET /stream/:streamId/chunk/:filename (serve chunks)
-
-HLS Endpoints:
-- GET /hls/media.m3u8 (global playlist)
-- GET /hls/:streamId/master.m3u8 (stream master playlist)
-- GET /hls/:streamId/:resolution/playlist.m3u8 (resolution playlist)
-- GET /hls/:streamId/:resolution/:segment (HLS segments)
-        `);
+        console.log(`Server running on: http://localhost:${PORT}`);
     });
 }
 
 // Handle graceful shutdown
 process.on('SIGINT', () => {
     console.log('\n🛑 Shutting down server...');
+    console.log(`📊 Final processing queue size: ${processingQueue.size}`);
     process.exit(0);
 });
 
 // Start the server
 startServer();
 
-module.exports = { app, getActiveStreams, getStreamChunks };
+module.exports = { app, getActiveStreams, getStreamChunks, getProcessingStats };
