@@ -1,0 +1,99 @@
+Perfect! Your multi-stream architecture makes much more sense. Here's how I'd structure it:
+
+## **Folder Structure:**
+```
+project/
+├── chunks/
+│   ├── stream_123/              # Each stream has unique ID
+│   │   ├── chunk_001.webm
+│   │   ├── chunk_002.webm
+│   │   └── chunk_003.webm
+│   ├── stream_456/
+│   │   ├── chunk_001.webm
+│   │   └── chunk_002.webm
+│   └── stream_789/
+├── hls_output/
+│   ├── stream_123/t
+│   │   ├── 240p/
+│   │   │   ├── segment_001.ts
+│   │   │   ├── segment_002.ts
+│   │   │   └── playlist.m3u8
+│   │   ├── 360p/
+│   │   │   ├── segment_001.ts
+│   │   │   └── playlist.m3u8
+│   │   ├── 720p/
+│   │   └── master.m3u8          # Stream-specific master playlist
+│   ├── stream_456/
+│   │   ├── 240p/
+│   │   ├── 360p/
+│   │   └── master.m3u8
+│   └── media.m3u8               # Global playlist (lists all streams)
+```
+
+## **Playlists Structure:**
+
+**Global Media Playlist (`media.m3u8`):**
+```m3u8
+#EXTM3U
+#EXT-X-VERSION:3
+
+#EXT-X-STREAM-INF:STREAM-ID="stream_123",RESOLUTION=1280x720
+stream_123/master.m3u8
+
+#EXT-X-STREAM-INF:STREAM-ID="stream_456",RESOLUTION=1280x720  
+stream_456/master.m3u8
+
+#EXT-X-STREAM-INF:STREAM-ID="stream_789",RESOLUTION=1280x720
+stream_789/master.m3u8
+```
+
+**Stream-specific Master Playlist (`stream_123/master.m3u8`):**
+```m3u8
+#EXTM3U
+#EXT-X-VERSION:3
+
+#EXT-X-STREAM-INF:BANDWIDTH=400000,RESOLUTION=426x240
+240p/playlist.m3u8
+
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+360p/playlist.m3u8
+
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720
+720p/playlist.m3u8
+```
+
+## **User Flow:**
+1. **User visits app** → Fetch `media.m3u8` → See all available streams
+2. **User selects stream_123** → Load `stream_123/master.m3u8` 
+3. **Player auto-selects quality** → Start with appropriate resolution
+4. **User can manually switch** → Change between 240p/360p/720p
+
+## **Processing Pipeline:**
+```bash
+# When new chunk arrives for stream_123
+chunks/stream_123/chunk_005.webm 
+↓
+ffmpeg processing (parallel for all qualities)
+↓
+hls_output/stream_123/240p/segment_005.ts
+hls_output/stream_123/360p/segment_005.ts  
+hls_output/stream_123/720p/segment_005.ts
+↓
+Update individual playlists + master.m3u8 + media.m3u8
+```
+
+## **API Endpoints:**
+```
+GET /streams                    → List all active streams
+GET /stream/:id/master.m3u8     → Get stream's quality options
+GET /stream/:id/240p/playlist.m3u8 → Get specific quality playlist
+```
+
+This structure gives you:
+- ✅ Multiple concurrent streams
+- ✅ Per-stream quality selection  
+- ✅ Global stream discovery
+- ✅ Clean separation of concerns
+- ✅ Easy to scale/manage
+
+Does this structure work for what you had in mind?
